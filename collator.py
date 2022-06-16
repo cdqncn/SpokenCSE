@@ -119,3 +119,97 @@ class DataCollatorForCorrectionMLM:
         inputs[indices_random] = random_words[indices_random]
 
         return inputs, labels
+    
+    class MultiHeadedAttention(nn.Module):
+    def __init__(self, config: Config):
+        super(MultiHeadedAttention, self).__init__()
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_mha_heads
+        assert self.embed_dim % self.num_heads == 0
+        self.head_dim = self.embed_dim // self.num_heads
+        
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+    
+    def forward(self, text_embeds, video_embeds):
+        """
+        Input
+            text_embeds: num_texts x embed_dim (b 768)                     key and value
+            video_embeds: num_vids x num_frames x embed_dim (b 8 768)          query
+        Output
+            o: num_vids x num_texts x embed_dim (b b 768)
+        """
+
+
+        # 我改的
+        num_vids, num_frames, _ = video_embeds.shape 
+        q = self.q_proj(video_embeds)
+        q=q.reshape(num_vids, num_frames, self.num_heads, self.head_dim) # b 8 12 64
+
+        # 我改的
+        num_texts, _ = text_embeds.shape
+        k = self.k_proj(text_embeds).unsqueeze(1) # b 1 768
+        v = self.v_proj(text_embeds).unsqueeze(1) # b 1 768
+        k = k.reshape(num_texts, 1, self.head_dim, self.num_heads) # b 1 64 12
+        v = v.reshape(num_texts, 1, self.num_heads, self.head_dim) # b 1 12 64
+
+        att_weight = F.softmax(torch.matmul(q, k)/math.sqrt(self.head_dim),dim=2) # b 8 12 12
+        attention = att_weight@v # b 8 12 64
+        attention = attention.reshape(num_texts, num_frames, self.embed_dim) # b 8 768
+        o = self.out_proj(attention) # b 8 768
+
+        return o
+
+
+class Transformer(nn.Module):
+    def __init__(self, config: Config):
+        super(Transformer, self).__init__()
+        self.embed_dim = config.embed_dim
+        dropout = config.transformer_dropout
+
+        self.cross_attn = MultiHeadedAttention(config)
+
+        self.linear_proj = nn.Linear(self.embed_dim, self.embed_dim)
+            
+        self.layer_norm1 = nn.LayerNorm(self.embed_dim)
+        self.layer_norm2 = nn.LayerNorm(self.embed_dim)
+        self.layer_norm3 = nn.LayerNorm(self.embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        self._init_parameters()
+
+    
+    def _init_parameters(self):
+        for name, param in self.named_parameters():
+            if 'linear' in name or 'proj' in name:
+                if 'weight' in name:
+                    nn.init.eye_(param)
+                elif 'bias' in name:
+                    param.data.fill_(0.)
+
+
+    def forward(self, text_embeds, video_embeds):
+        """
+        Input
+            text_embeds: num_texts x embed_dim
+            video_embeds: num_vids x num_frames x embed_dim
+        Output
+            out: num_vids x num_texts x embed_dim
+        """
+        original_video_embeds = video_embeds # b 8 196
+        text_embeds = self.layer_norm1(text_embeds) # key,value     b 196
+        video_embeds = self.layer_norm1(video_embeds) # query     b 8 196
+
+        # num_vids x num_texts x embed_dim
+        attn_out = self.cross_attn(text_embeds, video_embeds)+original_video_embeds
+        # attn_out = self.layer_norm2(attn_out)
+        attn_out = attn_out+self.dropout(self.linear_proj(self.layer_norm2(attn_out)))
+        # linear_out = self.linear_proj(attn_out)
+        # out = attn_out + self.dropout(linear_out)
+        # out = self.layer_norm3(out)
+
+        return attn_out
+
